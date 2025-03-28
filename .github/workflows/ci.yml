@@ -1,149 +1,127 @@
----
-name: OpenWISP Monitoring CI Build
+name: OpenWrt OpenWISP Monitoring CI Build
 
 on:
   push:
     branches:
       - master
-      - dev
   pull_request:
     branches:
       - master
-      - dev
 
 jobs:
+  tests:
+    name: QA-Checks and Tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        id: deps
+        run: |
+          pip install openwisp-utils[qa]
+          sudo ./install-dev.sh
+
+      - name: QA-Checks
+        run: ./run-qa-checks
+        env:
+          CI: 1
+
+      - name: Run sh-checker
+        uses: luizm/action-sh-checker@v0.9.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          sh_checker_comment: true
+
+      - name: Tests
+        if: ${{ !cancelled() && steps.deps.conclusion == 'success' }}
+        run: ./runtests
+
+      - name: Upload Coverage
+        if: ${{ success() }}
+        run: |
+          cd openwisp-monitoring/tests
+          luacov-coveralls -v
+        env:
+          COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build:
-    name: Python==${{ matrix.python-version }} | ${{ matrix.django-version }}
-    # Update this only when support for Django 3.2 is removed
-    runs-on: ubuntu-20.04
-
-    services:
-      redis:
-        image: redis
-        ports:
-          - 6379:6379
-
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version:
-          - "3.8"
-          - "3.9"
-          - "3.10"
-        django-version:
-          - django~=3.2.0
-          - django~=4.1.0
-          - django~=4.2.0
+    name: Build and upload package as artifacts
+    runs-on: ubuntu-24.04
+    env:
+      BUILD_DIR: '/home/runner/work/build'
+      DOWNLOADS_DIR: '/home/runner/work/downloads'
+      CORES: 2
 
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Cache APT packages
+      - name: Cache OpenWrt dependencies
+        id: cache
         uses: actions/cache@v4
-        with:
-          path: /var/cache/apt/archives
-          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
-          restore-keys: |
-            apt-${{ runner.os }}-
-
-      - name: Disable man page auto-update
-        run: |
-          echo 'set man-db/auto-update false' | sudo debconf-communicate >/dev/null
-          sudo dpkg-reconfigure man-db
-
-      - name: Set up and Cache Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: 'pip'
-          cache-dependency-path: |
-            **/requirements*.txt
-
-      - name: Install Dependencies
-        id: deps
-        run: |
-          sudo apt update -qq
-          sudo apt -qq install \
-            sqlite3 \
-            fping \
-            gdal-bin \
-            libproj-dev \
-            libgeos-dev \
-            libspatialite-dev \
-            spatialite-bin \
-            libsqlite3-mod-spatialite
-          pip install -U pip wheel setuptools
-          pip install -r requirements-test.txt
-          pip install -U -I -e .
-          pip uninstall -y django
-          pip install -U ${{ matrix.django-version }}
-          sudo npm install -g prettier
-
-      - name: Start InfluxDB
-        if: ${{ !cancelled() && steps.deps.conclusion == 'success' }}
-        run: docker compose up -d influxdb
-
-      - name: QA checks
-        run: |
-          ./run-qa-checks
-
-      - name: Tests
-        if: ${{ !cancelled() && steps.deps.conclusion == 'success' }}
-        run: |
-          coverage run runtests.py
-          # the next test runs focus on specific backend features, therefore
-          # we can skip selenium tests to improve speed and test consistency
-          SAMPLE_APP=1 coverage run runtests.py --exclude-tag=selenium_tests
-          TIMESERIES_UDP=1 coverage run runtests.py --exclude-tag=selenium_tests
-          coverage combine
-          coverage xml
         env:
-          SELENIUM_HEADLESS: 1
-          GECKO_LOG: 1
-
-      - name: Show gecko web driver log on failures
-        if: ${{ failure() }}
-        run: cat geckodriver.log
-
-      - name: Upload Coverage
-        if: ${{ success() }}
-        uses: coverallsapp/github-action@v2
+          cache-name: cache-openwrt-dependencies
         with:
-          parallel: true
-          format: cobertura
-          flag-name: python-${{ matrix.python-version }}-${{ matrix.django-version }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: '/home/runner/work/build'
+          key: ${{ runner.os }}-build-${{ env.cache-name }}
 
-  deploy:
-    name: Deploy Docker Image
-    runs-on: ubuntu-24.04
-    needs:
-      - build
-
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-    steps:
-      - uses: actions/checkout@master
-
-      # the following action is equivalent to
-      # echo "$DOCKER_HUB_SECRET" | docker login --username "$DOCKER_HUB_USERNAME" --password-stdin
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_SECRET }}
-
-      - name: Push to Docker
+      - name: Set Environment
         run: |
-          docker build . -t openwisp/openwisp-monitoring:develop
-          docker push openwisp/openwisp-monitoring:develop
+          echo "START_TIME=$(date +"%Y-%m-%d")" >> $GITHUB_ENV
+          echo "COMMIT_SHA=$(git log --pretty=format:'%h' -n 1)" >> $GITHUB_ENV
 
-  coveralls:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Coveralls Finished
-        uses: coverallsapp/github-action@v2
+      - name: Install dependencies
+        run: sudo apt install gawk
+
+      - name: Run Build
+        run: ./runbuild
+        env:
+          CI_CACHE: ${{ steps.cache.outputs.cache-hit }}
+
+      - name: Upload packages as artifacts
+        if: ${{ github.event_name=='push' }}
+        uses: actions/upload-artifact@v4
         with:
-          parallel-finished: true
+          name: Packages
+          path: "${{ env.DOWNLOADS_DIR }}/${{ env.START_TIME }}"
+
+      - name: Google Cloud Auth
+        if: ${{ github.event_name=='push' }}
+        uses: 'google-github-actions/auth@v2'
+        with:
+          project_id: ${{ secrets.GCS_PROJECT_ID }}
+          credentials_json: ${{ secrets.GCS_DOWNLOADS_SERVICE_ACCOUNT_JSON }}
+
+      - name: Google Cloud Setup
+        if: ${{ github.event_name=='push' }}
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCS_PROJECT_ID }}
+
+      - name: Generate SHA-256 Checksum
+        run: |
+          for file in ${{ env.DOWNLOADS_DIR }}/${{ env.START_TIME }}/openwisp_monitoring/*.ipk; do
+            sha256sum "$file" > "$file.sha256"
+          done
+         
+
+
+
+      - name: Upload compiled packages to downloads.openwisp.io
+        if: ${{ github.event_name=='push' }}
+        run: |
+          gsutil -m rsync -r ${{ env.SRC_URL }} ${{ env.DST_URL }}
+          gsutil -m rsync -r ${{ env.SRC_URL }} ${{ env.LATEST_URL }}
+        env:
+          SRC_URL: ${{ env.DOWNLOADS_DIR }}/${{ env.START_TIME }}/openwisp_monitoring
+          DST_URL: gs://${{ secrets.GCS_DOWNLOADS_BUCKET_NAME }}/openwisp-monitoring/${{ env.START_TIME }}-${{ env.COMMIT_SHA }}
+          LATEST_URL: gs://${{ secrets.GCS_DOWNLOADS_BUCKET_NAME }}/openwisp-monitoring/latest
